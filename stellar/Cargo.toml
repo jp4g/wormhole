@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "contracts/wormhole-interface",
   "contracts/wormhole-contract",
+  "contracts/executor"
 ]
 
 [workspace.package]

@@ -1,0 +1,15 @@
+[package]
+name = "wormhole-executor"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib"]   # rlib for tests, cdylib for Wasm
+doctest = false
+
+[dependencies]
+# For contract code: no std on Wasm
+soroban-sdk = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
