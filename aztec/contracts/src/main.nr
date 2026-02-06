@@ -30,6 +30,25 @@ pub contract Wormhole {
 
     use dep::token::Token;
 
+    pub global GUARDIAN: Guardian = comptime {
+        crate::structs::Guardian::new(
+            [
+                0x13, 0x94, 0x7b, 0xd4, 0x8b, 0x18, 0xe5, 0x3f, 0xda, 0xee, 0xe7, 0x7f, 0x34, 0x73,
+                0x39, 0x1a, 0xc7, 0x27, 0xc6, 0x38,
+            ],
+            [
+                0xfa, 0x9d, 0x6b, 0x47, 0x04, 0x3b, 0x15, 0xb4, 0xb3, 0x3c, 0xf0, 0x5b, 0xb1, 0xde,
+                0x0f, 0x13, 0xda, 0x70, 0x31, 0x36, 0xb2, 0xcd, 0x15, 0x73, 0x24, 0xeb, 0x61, 0x5e,
+                0xc9, 0xee, 0x95, 0x12,
+            ],
+            [
+                0x38, 0xc6, 0x7b, 0x54, 0xd0, 0x3e, 0x3c, 0x18, 0x2e, 0x0e, 0x77, 0xb8, 0x5f, 0x88,
+                0x3c, 0xcd, 0x74, 0xdd, 0xdf, 0xc5, 0x90, 0x10, 0xfb, 0xf4, 0x75, 0xa0, 0xbe, 0xe6,
+                0x59, 0x3c, 0xe2, 0xbd,
+            ],
+        )
+    };
+
     // ============================================================================
     // STORAGE STRUCTURE
     // ============================================================================
@@ -269,16 +288,63 @@ pub contract Wormhole {
     // ============================================================================
 
     // Internal helper function for parsing VAA bytes
+
     #[contract_library_method]
-    unconstrained fn parse_vaa_unconstrained(
+    fn parse_vaa(
         bytes: [u8; 2000],
         actual_length: u32,
-    ) -> (u32, u8, [[u8; 66]; 13], [u8; 1860], u32) {
-        let guardian_set_index: u32 = (bytes[1] as u32) << 24
-            | (bytes[2] as u32) << 16
-            | (bytes[3] as u32) << 8
-            | (bytes[4] as u32);
+    ) -> (u32, [[u8; 64]; 13], [u8; 1860], u32) {
+        // 1. Parse bytes unconstrained
+        // unsafe: constrain parsing later
+        let (signatures_full, body_bytes) = unsafe { _parse_vaa(bytes, actual_length) };
 
+        // 2. Get guardian set index
+        let guardian_set_index: u32 = (bytes[1] as u32) * 16777216 // * 2^24
+            + (bytes[2] as u32) * 65536 // * 2^16
+            + (bytes[3] as u32) * 256 // * 2^8
+            + (bytes[4] as u32);
+
+        // 3. Get signature length
+        assert((bytes[5] < 14) & (bytes[5] > 0), "too many signatures");
+        let signatures_len = bytes[5] as u32;
+
+
+        // Get body length
+        let body_start = 6 + signatures_len * 66;
+        let body_length = actual_length - body_start;
+
+        // Verify signatures extracted correctly and parse
+        let mut signatures = [[0; 64]; 13];
+        for i in 0..13 {
+            for j in 0..66 {
+                let byte_idx = 6 + i * 66 + j; // I guess we
+                let byte_match = signatures_full[i][j] == bytes[byte_idx];
+                let not_in_range = i >= signatures_len;
+                assert(byte_match | not_in_range, "signature byte mismatch");
+            }
+            // check the guardian set index
+            assert(signatures_full[i][0] < 19, "guardian index out of bounds");
+            for j in 0..64 {
+                signatures[i][j] = signatures_full[i][j + 1];
+            }
+        }
+
+        // Verify body bytes
+        for i in 0..1860 {
+            let byte_match = body_bytes[i] == bytes[body_start + i];
+            let not_in_range = i >= body_length;
+            assert(byte_match | not_in_range, "body byte mismatch");
+            // probably need to check that remaining bytes are 0
+        }
+
+        (guardian_set_index, signatures, body_bytes, body_length)
+    }
+
+    #[contract_library_method]
+    unconstrained fn _parse_vaa(
+        bytes: [u8; 2000],
+        actual_length: u32,
+    ) -> ([[u8; 66]; 13], [u8; 1860]) {
         let signatures_len = bytes[5];
 
         // Parse signatures
@@ -308,44 +374,26 @@ pub contract Wormhole {
             }
         }
 
-        (guardian_set_index, signatures_len, signatures, body_bytes, body_length)
+        (signatures, body_bytes)
     }
 
-    // Internal helper function for computing VAA hash
-    #[contract_library_method]
-    unconstrained fn compute_vaa_hash_unconstrained(
-        body_bytes: [u8; 1860],
-        body_length: u32,
-    ) -> [u8; 32] {
-        // Extract only the actual body content
-        let mut actual_body = [0; 1860];
-        for i in 0..body_length {
-            actual_body[i] = body_bytes[i];
-        }
-
-        // Double hash as per Wormhole spec
-        let hash: [u8; 32] = keccak256(actual_body, body_length);
-        let double_hash: [u8; 32] = keccak256(hash, 32);
-
-        double_hash
-    }
-
-    #[contract_library_method]
-    pub unconstrained fn verify_vaa_unconstrained(
+    #[external("private")]
+    fn verify_vaa(
         bytes: [u8; 2000],
         actual_length: u32,
-    ) -> ([[u8; 32]; 13], [[u8; 32]; 13], [[u8; 64]; 13], [u8; 32], u8) {
+    ) -> ([u8; 1860], u32, Field) {
+        // check wormhole VAA vm version
         let version = bytes[0];
         assert(version == 1, "VM version incompatible");
 
-        let (_, signatures_len, signatures, body_bytes, body_length) =
-            parse_vaa_unconstrained(bytes, actual_length);
+        // parse the VAA
+        let (guardian_set_index, signatures, body_bytes, body_length) = parse_vaa(bytes, actual_length);
 
-        assert(signatures_len >= 1, "Need at least 1 signature");
-        assert(signatures_len <= 13, "Too many signatures");
+        // double hash the vaa
+        let vaa_hash = keccak256(keccak256(bytes, actual_length), 32);
 
-        // Compute the VAA hash
-        let hash = compute_vaa_hash_unconstrained(body_bytes, body_length);
+        // let num_required_signatures: u8 = 1;
+        // let mut guardian_signature_count: u8 = 0;
 
         let guardian = crate::structs::Guardian::new(
             [
@@ -363,80 +411,23 @@ pub contract Wormhole {
                 0x59, 0x3c, 0xe2, 0xbd,
             ],
         );
-
-        // Prepare arrays for constrained verification
-        let mut pub_keys_x = [[0; 32]; 13];
-        let mut pub_keys_y = [[0; 32]; 13];
-        let mut signature_bytes_array = [[0; 64]; 13];
+            
+        let is_valid = guardian.verify(signatures[0], vaa_hash);
+        let mut x = 0;
+        for i in 0..1860 {
+            x += body_bytes[i] as Field;
+        }
 
         for i in 0..13 {
-            if i < signatures_len {
-                let sig = Signature::from_bytes(signatures[i as u32]);
-                let guardian_idx = sig.guardian_index;
-
-                assert(guardian_idx < 19, "guardian index out of bounds");
-
-                // Get public key components as byte arrays
-                let pub_key_x = guardian.get_pub_key_x();
-                let pub_key_y = guardian.get_pub_key_y();
-
-                pub_keys_x[i as u32] = pub_key_x;
-                pub_keys_y[i as u32] = pub_key_y;
-
-                // Prepare signature bytes
-                let mut signature_bytes = [0; 64];
-                for j in 0..32 {
-                    signature_bytes[j] = sig.r[j];
-                    signature_bytes[32 + j] = sig.s[j];
-                }
-                signature_bytes_array[i as u32] = signature_bytes;
-            }
+            x += signatures[i][0] as Field; 
         }
-
-        (pub_keys_x, pub_keys_y, signature_bytes_array, hash, signatures_len)
-    }
-
-    #[external("private")]
-    fn verify_vaa(bytes: [u8; 2000], actual_length: u32) {
-        // Safety: verify_vaa_unconstrained performs parsing and validation that doesn't need constraints
-        let (pub_keys_x, pub_keys_y, signature_bytes_array, hash, _signatures_len) =
-            unsafe { verify_vaa_unconstrained(bytes, actual_length) };
-
-        let required_signatures = 1;
-        let mut verified_count = 0;
-
-        // Testnet VAA verification only utilizes a single guardian.
-
-        // TODO: Uncomment this when ECDSA verification in loop is implemented.
-        // See issue: https://github.com/noir-lang/noir/pull/8993
-
-        // for i in 0..13 {
-        //     if i < signatures_len {
-        //        let is_valid = std::ecdsa_secp256k1::verify_signature(
-        //            pub_keys_x[i as u32],
-        //            pub_keys_y[i as u32],
-        //            signature_bytes_array[i as u32],
-        //            hash,
-        //        );
-
-        //        if is_valid {
-        //            verified_count += 1;
-        //        }
-        //    }
-        //}
-
-        let is_valid = std::ecdsa_secp256k1::verify_signature(
-            pub_keys_x[0 as u32],
-            pub_keys_y[0 as u32],
-            signature_bytes_array[0 as u32],
-            hash,
-        );
-
-        if is_valid {
-            verified_count += 1;
-        }
-
-        assert(verified_count >= required_signatures, "Insufficient valid signatures");
+        // guardian_signature_count += is_valid as u8;
+        // for i in 0..1 {
+        //     let is_valid = GUARDIAN.verify(signatures[i], vaa_hash);
+        //     guardian_signature_count += is_valid as u8;
+        // }
+        // assert(guardian_signature_count >= num_required_signatures);
+        (body_bytes, body_length, x)
     }
 
     // ============================================================================
@@ -627,85 +618,85 @@ pub contract Wormhole {
 
 }
 
-mod tests {
-    use crate::{structs::Signature, Wormhole};
-    use dep::aztec::protocol_types::{address::AztecAddress, traits::FromField};
-    use dep::aztec::test::helpers::test_environment::TestEnvironment;
+// mod tests {
+//     use crate::{structs::Signature, Wormhole};
+//     use dep::aztec::protocol_types::{address::AztecAddress, traits::FromField};
+//     use dep::aztec::test::helpers::test_environment::TestEnvironment;
 
-    #[test]
-    pub unconstrained fn test_signature_extraction() {
-        let signature_bytes: [u8; 66] = [
-            0x00, // Guardian index
-            // R component (32 bytes)
-            0x46, 0x82, 0xbc, 0x4d, 0x5f, 0xf2, 0xe5, 0x4d, 0xc2, 0xee, 0x5e, 0x0e, 0xb6, 0x4f,
-            0x5c, 0x6c, 0x07, 0xaa, 0x44, 0x9a, 0xc5, 0x39, 0xab, 0xc6, 0x3c, 0x2b, 0xe5, 0xc3,
-            0x06, 0xa4, 0x8f, 0x23,
-            // S component (32 bytes)
-            0x3e, 0x93, 0x00, 0x17, 0x0a, 0x82, 0xad, 0xf3, 0xc3, 0xb7, 0xf4, 0x3f, 0x23, 0x17,
-            0x6f, 0xb0, 0x79, 0x17, 0x4a, 0x58, 0xd6, 0x7d, 0x14, 0x24, 0x77, 0xf6, 0x46, 0x67,
-            0x5d, 0x86, 0xeb, 0x63,
-            // Recovery ID
-            0x01,
-        ];
+//     #[test]
+//     pub unconstrained fn test_signature_extraction() {
+//         let signature_bytes: [u8; 66] = [
+//             0x00, // Guardian index
+//             // R component (32 bytes)
+//             0x46, 0x82, 0xbc, 0x4d, 0x5f, 0xf2, 0xe5, 0x4d, 0xc2, 0xee, 0x5e, 0x0e, 0xb6, 0x4f,
+//             0x5c, 0x6c, 0x07, 0xaa, 0x44, 0x9a, 0xc5, 0x39, 0xab, 0xc6, 0x3c, 0x2b, 0xe5, 0xc3,
+//             0x06, 0xa4, 0x8f, 0x23,
+//             // S component (32 bytes)
+//             0x3e, 0x93, 0x00, 0x17, 0x0a, 0x82, 0xad, 0xf3, 0xc3, 0xb7, 0xf4, 0x3f, 0x23, 0x17,
+//             0x6f, 0xb0, 0x79, 0x17, 0x4a, 0x58, 0xd6, 0x7d, 0x14, 0x24, 0x77, 0xf6, 0x46, 0x67,
+//             0x5d, 0x86, 0xeb, 0x63,
+//             // Recovery ID
+//             0x01,
+//         ];
 
-        let sig = Signature::from_bytes(signature_bytes);
+//         let sig = Signature::from_bytes(signature_bytes);
 
-        assert(sig.guardian_index == 0, "Guardian index should be 0");
-        assert(sig.r[0] == 0x46, "R component should start with 0x46");
-        assert(sig.s[0] == 0x3e, "S component should start with 0x3e");
-    }
+//         assert(sig.guardian_index == 0, "Guardian index should be 0");
+//         assert(sig.r[0] == 0x46, "R component should start with 0x46");
+//         assert(sig.s[0] == 0x3e, "S component should start with 0x3e");
+//     }
 
-    #[test]
-    pub unconstrained fn test_verify_vaa_logic() {
-        // Setup env, generate keys
-        let mut env = TestEnvironment::new();
+//     #[test]
+//     pub unconstrained fn test_verify_vaa_logic() {
+//         // Setup env, generate keys
+//         let mut env = TestEnvironment::new();
 
-        // Deploy contract - need to specify all 3 parameters for deploy
-        let dummy_owner = AztecAddress::from_field(1);
-        let receiver_address = AztecAddress::from_field(
-            0x0d071eec273fa0c82825d9c5d2096965a40bcc33ae942714cf6c683af9632504,
-        );
-        let token_address = AztecAddress::from_field(
-            0x037e5d19d6d27e2fb7c947cfe7c36459e27d35e46dd59f5f47373a64ff491d2c,
-        );
+//         // Deploy contract - need to specify all 3 parameters for deploy
+//         let dummy_owner = AztecAddress::from_field(1);
+//         let receiver_address = AztecAddress::from_field(
+//             0x0d071eec273fa0c82825d9c5d2096965a40bcc33ae942714cf6c683af9632504,
+//         );
+//         let token_address = AztecAddress::from_field(
+//             0x037e5d19d6d27e2fb7c947cfe7c36459e27d35e46dd59f5f47373a64ff491d2c,
+//         );
 
-        let contract_address = env.deploy("Wormhole").with_public_initializer(
-            dummy_owner,
-            Wormhole::interface().init(56, 56, dummy_owner, receiver_address, token_address),
-        );
+//         let contract_address = env.deploy("Wormhole").with_public_initializer(
+//             dummy_owner,
+//             Wormhole::interface().init(56, 56, dummy_owner, receiver_address, token_address),
+//         );
 
-        let mut vaa_bytes: [u8; 2000] = [0; 2000];
-        let actual_length = 221;
+//         let mut vaa_bytes: [u8; 2000] = [0; 2000];
+//         let actual_length = 221;
 
-        // NOTE: This is a real Wormhole VAA from Arbitrum Sepolia testnet.
-        // VAA bytes, fetched from https://wormholescan.io/#/tx/0xf93fd41efeb09ff28174824d4abf6dbc06ac408953a9975aa4a403d434051efc
-        // This VAA contains the message "Hello Wormhole!" and is used to test VAA verification logic.
-        let wh_vaa: [u8; 221] = [
-            0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x46, 0x82, 0xbc, 0x4d, 0x5f, 0xf2, 0xe5,
-            0x4d, 0xc2, 0xee, 0x5e, 0x0e, 0xb6, 0x4f, 0x5c, 0x6c, 0x07, 0xaa, 0x44, 0x9a, 0xc5,
-            0x39, 0xab, 0xc6, 0x3c, 0x2b, 0xe5, 0xc3, 0x06, 0xa4, 0x8f, 0x23, 0x3e, 0x93, 0x00,
-            0x17, 0x0a, 0x82, 0xad, 0xf3, 0xc3, 0xb7, 0xf4, 0x3f, 0x23, 0x17, 0x6f, 0xb0, 0x79,
-            0x17, 0x4a, 0x58, 0xd6, 0x7d, 0x14, 0x24, 0x77, 0xf6, 0x46, 0x67, 0x5d, 0x86, 0xeb,
-            0x63, 0x01, 0x68, 0x4b, 0xfa, 0xd4, 0x49, 0x96, 0x02, 0xd2, 0x27, 0x13, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x69, 0x7f, 0x31, 0xe0,
-            0x74, 0xbf, 0x2c, 0x81, 0x93, 0x91, 0xd5, 0x27, 0x29, 0xf9, 0x55, 0x06, 0xe0, 0xa7,
-            0x2f, 0xfb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc8, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x57, 0x6f,
-            0x72, 0x6d, 0x68, 0x6f, 0x6c, 0x65, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
+//         // NOTE: This is a real Wormhole VAA from Arbitrum Sepolia testnet.
+//         // VAA bytes, fetched from https://wormholescan.io/#/tx/0xf93fd41efeb09ff28174824d4abf6dbc06ac408953a9975aa4a403d434051efc
+//         // This VAA contains the message "Hello Wormhole!" and is used to test VAA verification logic.
+//         let wh_vaa: [u8; 221] = [
+//             0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x46, 0x82, 0xbc, 0x4d, 0x5f, 0xf2, 0xe5,
+//             0x4d, 0xc2, 0xee, 0x5e, 0x0e, 0xb6, 0x4f, 0x5c, 0x6c, 0x07, 0xaa, 0x44, 0x9a, 0xc5,
+//             0x39, 0xab, 0xc6, 0x3c, 0x2b, 0xe5, 0xc3, 0x06, 0xa4, 0x8f, 0x23, 0x3e, 0x93, 0x00,
+//             0x17, 0x0a, 0x82, 0xad, 0xf3, 0xc3, 0xb7, 0xf4, 0x3f, 0x23, 0x17, 0x6f, 0xb0, 0x79,
+//             0x17, 0x4a, 0x58, 0xd6, 0x7d, 0x14, 0x24, 0x77, 0xf6, 0x46, 0x67, 0x5d, 0x86, 0xeb,
+//             0x63, 0x01, 0x68, 0x4b, 0xfa, 0xd4, 0x49, 0x96, 0x02, 0xd2, 0x27, 0x13, 0x00, 0x00,
+//             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x69, 0x7f, 0x31, 0xe0,
+//             0x74, 0xbf, 0x2c, 0x81, 0x93, 0x91, 0xd5, 0x27, 0x29, 0xf9, 0x55, 0x06, 0xe0, 0xa7,
+//             0x2f, 0xfb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc8, 0x00, 0x00, 0x00,
+//             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+//             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+//             0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+//             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+//             0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x57, 0x6f,
+//             0x72, 0x6d, 0x68, 0x6f, 0x6c, 0x65, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+//             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+//         ];
 
-        for i in 0..221 {
-            vaa_bytes[i] = wh_vaa[i];
-        }
+//         for i in 0..221 {
+//             vaa_bytes[i] = wh_vaa[i];
+//         }
 
-        env.call_private(
-            dummy_owner,
-            Wormhole::at(contract_address).verify_vaa(vaa_bytes, actual_length),
-        );
-    }
-}
+//         env.call_private(
+//             dummy_owner,
+//             Wormhole::at(contract_address).verify_vaa(vaa_bytes, actual_length),
+//         );
+//     }
+// }

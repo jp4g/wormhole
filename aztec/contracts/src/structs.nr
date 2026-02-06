@@ -343,6 +343,15 @@ impl Guardian {
     pub fn get_pub_key_y_field(self) -> Field {
         self.address.get_pub_key_y_field()
     }
+
+    pub fn verify(self, signature: [u8; 64], hash: [u8; 32]) -> bool {
+        std::ecdsa_secp256k1::verify_signature(
+            self.get_pub_key_x(),
+            self.get_pub_key_y(),
+            signature,
+            hash,
+        )
+    }
 }
 
 #[derive(Deserialize, Serialize)]
